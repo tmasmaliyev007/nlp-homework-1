@@ -20,18 +20,22 @@ import cv2
 import pytesseract as pyt
 
 # Typing purposes
-from typing import List
+from typing import List, Dict
+
+# Sheet write purposes
+import pandas as pd
 
 class PresLibScraper:
     def __init__(self) -> None:
         # Base topics
         self.topics: List[str] = [
             'informatics',
-            'ecology'
-            'history'
-            'economy'
+            'ecology',
+            'history',
+            'economy',
             'customs'
         ]
+        self.indv_doc_ctr: int = 20
 
         # Base & Endpoint and Post urls
         self.base_url: str = 'https://www.preslib.az'
@@ -51,6 +55,11 @@ class PresLibScraper:
         # Define directories
         os.makedirs('logs', exist_ok=True)
         os.makedirs('docs', exist_ok=True)
+
+        # Metadata
+        self.meta_data = pd.DataFrame(
+            columns=['Doc_id', 'Title', 'Author', 'Publishing_house', 'Place_of_publication', 'Publication_date', 'Pages', 'Category', 'Full_Path']
+        )
     
     def get_captcha_code(self, captcha_url: str) -> str:
         # Get Request
@@ -103,6 +112,9 @@ class PresLibScraper:
         
 
     def download_doc(self, url: str, destination: str) -> None:
+        # Meta information
+        info: Dict[str, str] = {}
+
         # Document ID
         doc_id = os.path.basename(url)
 
@@ -112,6 +124,51 @@ class PresLibScraper:
 
         # Parse HTML Content
         soup = BeautifulSoup(response.text, 'html.parser')
+
+        # region Metadata
+
+        # Get originality
+        label = soup.find('dt', string=lambda t: 'Place of publication:' in t)
+        originality: str = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        # If publication is different from Bakı, don't scrape that
+        if originality != 'Bakı':
+            return False
+        
+        # Extract Title
+        label = soup.find('dt', string=lambda t: 'Title:' in t)
+        title: str = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        # Extract Author
+        label = soup.find('dt', string=lambda t: 'Author:' in t)
+        author = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        # Extract Publishing_house
+        label = soup.find('dt', string=lambda t: 'Publishing house:' in t)
+        p_house = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        # Extract Publication_date
+        label = soup.find('dt', string=lambda t: 'Publication date:' in t)
+        p_date = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        # Extract Pages
+        label = soup.find('dt', string=lambda t: 'Pages:' in t)
+        pages = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        # Extract Category
+        label = soup.find('dt', string=lambda t: 'Category:' in t)
+        category = label.find_next_sibling('dd').get_text(strip=True) if label is not None else ''
+
+        info['Doc_id'] = doc_id
+        info['Title'] = title
+        info['Author'] = author
+        info['Publishing_house'] = p_house
+        info['Place_of_publication'] = originality
+        info['Publication_date'] = p_date
+        info['Pages'] = pages
+        info['Category'] = category
+        
+        # endregion
 
         # Get CSRF Token
         csrf_token = soup.find('input', {'name': 'csrf_preslib'}).get('value')
@@ -140,6 +197,9 @@ class PresLibScraper:
             with open(f_path, 'wb') as f:
                 for chunk in p_response.iter_content(chunk_size=8192):
                     f.write(chunk)
+
+            info['Full_Path'] = f_path
+            self.meta_data.loc[len(self.meta_data)] = info
                 
             return True
 
@@ -176,9 +236,13 @@ class PresLibScraper:
                     article_tags = soup.find('div', {'class': 'row gx-md-3 gy-5 mb-3'})\
                                        .find_all('article')
                     
+                    if len(article_tags) == 0:
+                        self.logger.info("Reached end of content: No more pages to load.")
+                        break
+
                     self.logger.info(f"Page {curr_page.page} - Extracted {len(article_tags)} documents.")
-                    
-                    for tag in tqdm(article_tags):
+
+                    for tag in article_tags:
                         link = tag.find('a').get('href')
 
                         # Form full document url
@@ -188,7 +252,7 @@ class PresLibScraper:
                         status = self.download_doc(f_doc_url, destination)
 
                         # Get document id
-                        doc_id = os.path.basename(url)
+                        doc_id = os.path.basename(f_doc_url)
 
                         if status:
                             download_ctr+= 1
@@ -196,13 +260,21 @@ class PresLibScraper:
                         else:
                             self.logger.info(f'Page {curr_page.page} - Topic {topic} - Error on book {doc_id}.')
 
-                        self.logger.info(f'Page {curr_page.page} - Downloaded documents {download_ctr}/{len(article_tags)}')
+                        self.logger.info(f'Page {curr_page.page} - Downloaded documents {download_ctr}/{self.indv_doc_ctr}')
+
                         time.sleep(5)
 
-                    break
+                        if self.indv_doc_ctr == download_ctr:
+                            curr_page.is_last_page = True
+                            break
+                    
+                    curr_page.page+= 1
 
                 except requests.HTTPError as e:
-                    self.logger.error(f"Error on {topic} - Page - {curr_page}\n{e}")
+                    self.logger.error(f'Error on {topic} - Page - {curr_page}\n{e}')
                     break
-            
-            break
+        
+        self.logger.info('Scraped all topics.')
+
+        # Save metadata
+        self.meta_data.to_csv('docs/metadata.csv', index=False)
